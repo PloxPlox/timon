@@ -48,6 +48,62 @@ export const CFLAGS = [
   '-fstack-protector-strong', '-D_FORTIFY_SOURCE=2', '-static', '-s',
 ];
 
+/**
+ * The instruction set each architecture is compiled for, named rather than
+ * left to the build machine's compiler. A toolchain whose default is
+ * x86-64-v3 produced a launcher that dies with SIGILL on every processor
+ * without AVX2 (Celeron, Pentium, Atom, Intel before 2013), and every mission
+ * on those machines then ran unfenced.
+ */
+export const ARCH_CFLAGS = {
+  x64: ['-march=x86-64', '-mtune=generic'],
+  arm64: [],
+};
+
+/**
+ * `-mneeded` (GCC 11+) makes the launcher's own code declare the ISA level it
+ * uses in the ELF note; without it the note only reflects the C library, and
+ * a compiler defaulting to x86-64-v3 would pass the check below unseen.
+ * Asked of the compiler rather than assumed, so an older one still builds.
+ */
+function acceptsFlag(compiler, flag) {
+  try {
+    execFileSync(compiler, [flag, '-x', 'c', '-c', '-o', '/dev/null', '-'], { input: 'int main(void) { return 0; }\n', stdio: ['pipe', 'ignore', 'ignore'] });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** x86-64 levels above the baseline a shipped launcher may not require. */
+const ABOVE_BASELINE = /x86-64-v[234]/;
+
+/**
+ * The "x86 ISA needed" note of an ELF file, or null when it has none.
+ * `readelf` comes with binutils, which every compiler this script uses needs.
+ * Its stderr is kept out of the build log: on Fedora it warns about every gap
+ * in the annobin notes, which says nothing about the ISA.
+ */
+function isaNeededNote(binary) {
+  const notes = execFileSync('readelf', ['-n', binary], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, LC_ALL: 'C' } });
+  return /x86 ISA needed:\s*(.+)/.exec(notes)?.[1]?.trim() ?? null;
+}
+
+/**
+ * Refuses an x64 launcher that requires more than the x86-64 baseline. The
+ * compiler flag alone is not proof: a static C library built for a higher
+ * level by the build machine's distribution carries its own requirement into
+ * the binary, and only the linked result says what it needs.
+ */
+export function assertBaselineIsa(binary, arch, readNote = isaNeededNote) {
+  if (arch !== 'x64') return;
+  const needed = readNote(binary);
+  if (needed && ABOVE_BASELINE.test(needed)) {
+    throw new Error(`${binary} requires ${needed}: it would crash on processors without these instructions. `
+      + 'Build it with a compiler and a static C library that target the x86-64 baseline (musl-tools, or the gcc and static glibc of a distribution that targets the baseline).');
+  }
+}
+
 function available(compiler) {
   try {
     execFileSync(compiler, ['--version'], { stdio: 'ignore' });
@@ -63,8 +119,10 @@ export function buildFence(arch, out = fenceBuildOutput(arch), { host = hostArch
   const compiler = compilerCandidates(arch, host, env).find(available);
   if (!compiler) return null;
   mkdirSync(dirname(out), { recursive: true });
-  execFileSync(compiler, [...CFLAGS, '-o', out, join(FENCE_SOURCE_DIR, 'timon-fence.c')], { stdio: 'inherit' });
+  const needed = arch === 'x64' && acceptsFlag(compiler, '-mneeded') ? ['-mneeded'] : [];
+  execFileSync(compiler, [...CFLAGS, ...ARCH_CFLAGS[arch], ...needed, '-o', out, join(FENCE_SOURCE_DIR, 'timon-fence.c')], { stdio: 'inherit' });
   chmodSync(out, 0o755);
+  assertBaselineIsa(out, arch);
   // A binary for this machine must run here; another architecture is only
   // checked for presence (packages are built on their own machine anyway).
   if (arch === host) execFileSync(out, ['--version'], { stdio: 'ignore' });
