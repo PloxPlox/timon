@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import {
   encodeFencePolicy, fenceBinaryCandidates, fenceDeclaredByRelease, FENCE_EXIT, FENCE_POLICY_HEADER, FENCE_RELEASE_FILE,
-  fenceLaunchDecision, fenceStatus, findFenceBinary, parseFenceProbe, probeFence, type FencePolicy, type FenceProbe,
+  fenceLaunchDecision, fenceProbeOf, fenceStatus, findFenceBinary, parseFenceProbe, probeFence, type FencePolicy, type FenceProbe,
 } from './fence.js';
 
 test('the policy is NUL-separated: header, socket option, then one pair per path', () => {
@@ -114,6 +114,30 @@ test('a declared launcher that is missing, replaced or does not run is an altera
   const mute = shippedRoot('launcher');
   const silent = fenceStatus({ ...LINUX, orchestratorRoot: mute.root, release: signed(mute.digest), probe: () => SILENT });
   assert.ok(silent.state === 'tampered' && /does not run/.test(silent.reason));
+});
+
+test('a launcher killed by SIGILL is an unsupported processor, not a launcher that stayed silent', () => {
+  const illegal = fenceProbeOf({ status: null, signal: 'SIGILL', stdout: '' });
+  assert.equal(illegal.unsupportedCpu, true);
+  assert.equal(illegal.answered, false);
+  assert.match(illegal.reason ?? '', /processor lacks an instruction/);
+  const mute = fenceProbeOf({ status: null, signal: 'SIGKILL', stdout: '' });
+  assert.equal(mute.unsupportedCpu, undefined);
+  assert.equal(mute.reason, 'the fence launcher did not answer its probe');
+  assert.match(fenceProbeOf({ error: new Error('spawn EACCES'), status: null, signal: null, stdout: '' }).reason ?? '', /cannot run \(spawn EACCES\)/);
+});
+
+test('a declared, intact launcher the processor cannot execute is the machine, not an alteration', () => {
+  const { root, digest } = shippedRoot('launcher');
+  const sigill = fenceProbeOf({ status: null, signal: 'SIGILL', stdout: '' });
+  const status = fenceStatus({ ...LINUX, orchestratorRoot: root, release: signed(digest), probe: () => sigill });
+  assert.equal(status.state, 'unsupported');
+  const auto = fenceLaunchDecision('auto', status);
+  assert.ok(auto.action === 'unfenced' && !auto.tampered);
+  assert.doesNotMatch(auto.warning ?? '', /altered/);
+  assert.match(auto.warning ?? '', /SIGILL/);
+  const refused = fenceLaunchDecision('enforce', status);
+  assert.ok(refused.action === 'refuse' && !refused.tampered && !/altered/.test(refused.error));
 });
 
 test('a declared, intact launcher on a kernel without Landlock is the machine, not an alteration', () => {

@@ -101,6 +101,12 @@ export interface FenceProbe {
   readonly seccomp: boolean;
   /** Why it is unavailable, in English, for doctor and the logs. */
   readonly reason?: string;
+  /**
+   * True when the processor killed the launcher on an instruction it lacks
+   * (SIGILL). The file is the one the release signed: the machine, not the
+   * package, is at fault, and reinstalling would change nothing.
+   */
+  readonly unsupportedCpu?: true;
 }
 
 /** Parses `timon-fence --probe`: `landlock-abi=N seccomp=yes|no`. */
@@ -116,11 +122,30 @@ export function parseFenceProbe(stdout: string, status: number | null): FencePro
   return { available: false, answered: true, abi, seccomp, reason };
 }
 
+/** What one run of `timon-fence --probe` returned, as `spawnSync` reports it. */
+export interface FenceProbeRun {
+  readonly error?: Error;
+  readonly status: number | null;
+  readonly signal: NodeJS.Signals | null;
+  readonly stdout: string;
+}
+
+/** Reads a probe run; kept apart from the spawn so every outcome is testable. */
+export function fenceProbeOf(run: FenceProbeRun): FenceProbe {
+  if (run.error) return { available: false, answered: false, abi: 0, seccomp: false, reason: `the fence launcher cannot run (${run.error.message})` };
+  if (run.signal === 'SIGILL') {
+    return {
+      available: false, answered: false, abi: 0, seccomp: false, unsupportedCpu: true,
+      reason: 'this processor lacks an instruction the fence launcher was built for (SIGILL)',
+    };
+  }
+  return parseFenceProbe(run.stdout, run.status);
+}
+
 /** Asks the launcher what this kernel supports. */
 export function probeFence(binary: string): FenceProbe {
   const result = spawnSync(binary, ['--probe'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
-  if (result.error) return { available: false, answered: false, abi: 0, seccomp: false, reason: `the fence launcher cannot run (${result.error.message})` };
-  return parseFenceProbe(result.stdout, result.status);
+  return fenceProbeOf({ ...(result.error ? { error: result.error } : {}), status: result.status, signal: result.signal, stdout: result.stdout ?? '' });
 }
 
 /**
@@ -275,6 +300,9 @@ export function fenceStatus(options: FenceStatusOptions = {}): FenceStatus {
     if (problem) return { state: 'tampered', reason: `the fence launcher this release ships (${binary}) is ${problem}`, abi: 0 };
     const result = probe(binary);
     if (result.available) return { state: 'ready', binary, abi: result.abi, seccomp: result.seccomp };
+    // An intact file the processor cannot execute is the machine's limit,
+    // worded apart from an alteration: reinstalling would not help.
+    if (result.unsupportedCpu) return { state: 'unsupported', reason: result.reason ?? 'processor not supported by the fence launcher', abi: 0 };
     if (!result.answered) return { state: 'tampered', reason: `the fence launcher this release ships (${binary}) does not run: ${result.reason ?? 'no answer'}`, abi: 0 };
     return { state: 'unsupported', reason: result.reason ?? 'no fence on this kernel', abi: result.abi };
   }
